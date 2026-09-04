@@ -1,0 +1,11 @@
+ bss2:,name,
+ ,xta,=1
+ ,atx,alpha
+ ,xta,gamma
+ ,atx,delta+2
+ ,call,stop*
+ alpha:,bss,1
+ beta:,bss,3
+ gamma:,bss,1
+ delta:,bss,5
+ ,end,

@@ -115,8 +115,9 @@ Each combined function and where it comes from / what changes:
   `memory[load_base + i]`, skip DMS magic, length-sanity check (union of the five checks),
   trailing-zero trim for Pascal-B (`while (memory[total_len-1]==0) --total_len;`, from dtran4).
 - **`fill_lengths_dms()`** — from **dtran2** (packed+unpacked, `head_off` scan, `cmd_off`
-  indirection, full `C ...` banner). BSS handling relaxed to **warn** (dtran3) instead of
-  hard `exit` (dtran2).
+  indirection, full `C ...` banner). The BSS length is now simply reported in the banner:
+  dtran2's hard `exit` and dtran3's warning are both gone, since `prbss` emits the section
+  (§4, §9).
 - **`fill_lengths_pa()`** — from dtran1/5 (`total_len=memory[5]`, `main_off=memory[010]`,
   `code_off = find_code_offset()`).
 - **`fill_lengths_pb()`** — from dtran4 (paged `total_len`, `main_off=02000`,
@@ -155,7 +156,16 @@ Each combined function and where it comes from / what changes:
 - **`prconst`** — `_dms(addr,len,litconst)` (dtran2/3) / `_pascal(litconst)` over `[011,code_off)` (dtran1/5/4).
 - **`prtext`** — `_dms` (cmd section via `cmd_off`, dtran2/3) / `_pascal` (`code_off..total_len`
   with `code_map`, inline const, page markers, dtran4 superset of dtran1/5).
-- **`prbss`** — from dtran3 (warning note).
+- **`prbss(addr,len,litconst)`** — real implementation (dtran2/3 only left a `C here be
+  BSS entries` note). BSS occupies runtime addresses `[cmd_len+const_len, +bss_len)` but no
+  file space, so it is reconstructed purely from `labels[]`: one `,BSS,n` per labelled run,
+  breaking at each address that carries a label, which preserves both the symbol positions
+  and the total size. Only addresses the object module actually records get a label — a BSS
+  symbol that is never referenced leaves no trace in the file and is folded into the
+  preceding run. `,DATA,` restarts the location counter at the BSS base, so words shared
+  with the data section are emitted *unlabelled* here (`prconst_dms` prints those labels,
+  and MADLEN rejects a doubly-described identifier); under `-c` that suppression is lifted,
+  because `prdata` emits assignments which define nothing.
 
 ### Symbol tables
 - **DMS:** `gak`, `dump_sym`, `dump_symtab` — from dtran2/3 (identical; use `nooctal` form).
@@ -189,6 +199,34 @@ Each combined function and where it comes from / what changes:
    combined tool must emit `J+M` for a re-assemblable `-e -l` round-trip (see §8).
 7. Dead `prsets` `strtol` block (dtran2/3) → removed.
 8. Pascal-B banner reading unloaded `memory[1]/[2]` (dtran4) → banner dropped entirely (§6).
+9. `-l` emitted the ` /:,BSS,` anchor twice (once in `fill_lengths_dms`, once in
+   `prtext_dms`) → MADLEN rejected the second as a doubly-described identifier, breaking
+   every `-l` round-trip. `prtext_dms` now owns it.
+10. The `,DATA,` block was gated on `data_len` alone, so a module carrying `,SET,` operators
+    but no data words of its own (`,SET,` from a literal → `data_len == 0`, `set_len > 0`)
+    silently dropped them → gated on `data_len || set_len`.
+11. **A BESM-6 integer is 41 bits wide, and signed.** The value is the two's-complement
+    field in bits 41..1, under a fixed exponent of `0150` in bits 48..42 — verified against
+    MADLEN, which assembles `,INT,0` to `6400000000000000`, `,INT,16777216` to
+    `6400000100000000`, `,INT,-5` to `6437777777777773`, and accepts the full
+    ±(2⁴⁰−1) range. The DMS backend tested `(val >> 24) == 064000000` and masked
+    `val & 077777777`, i.e. it assumed a **24-bit unsigned** payload, so it silently
+    misread every integer outside that range. Three consequences, all fixed via the shared
+    `is_int` / `int_bits` / `int_value` helpers:
+    - Any `|value| ≥ 2²⁴`, and *every* negative, failed the test and was dumped as an
+      opaque `,LOG,6437777777777777`. On `dms.o`, 32 such words now decode — `,INT,-1`,
+      `,INT,-2`, `,INT,-13697024`, `,INT,109951162777`, `,INT,16777216`.
+    - `prconst_dms` emitted `,INT,` in octal above 200000 (`,INT,01111740B`), which MADLEN
+      reads as an out-of-range address (`OШИБKA B AДPECE`). The assemblable form has to be
+      decimal, so **`,INT,` is now decimal regardless of magnitude**, in every mode.
+      (68 lines of `dms.o`; radix only. The Pascal backends already emitted decimal.)
+    - `get_literal_dms` emitted the large-value octal literal **unparenthesized**
+      (`,AAX,77700000B`), unlike every other literal it produces → `,AAX,(77700000B)`.
+
+    Pascal-B's `format_map` keeps its narrower `064000000`/`064377777` test **on purpose**:
+    there the word may be code, so matching every word whose top 7 bits are `0150` would
+    misfire on roughly 1/128 of the image. Within that narrower range its `(int)val`
+    printing is exact (the tag never reaches bit 32), so it is left alone.
 
 ## 6. Resolved decisions (author, 2026-06-16)
 - **IMM64 family** (`YTA`/`E+N`/`E-N`/`ASN`) = `OPCODE_IMM64`; zero immediate → bare op, every
@@ -230,6 +268,11 @@ with `dtran -F dms`, and diffs against the golden `tests/<name>.expected`:
 | `control` | `UJ`, `UZA/U1A/VZM/V1M/VLM`, `VJM`, `UTC/WTC` with a label target |
 | `extops`  | extended `*50/*51/*60/*64/*70/CTX/*76` and `*74` stop |
 | `literals`| constant pool: `INT` (small/large), `LOG`, `TEXT` (8H), `ISO` (6H) |
+| `bss`     | a single BSS word, referenced from the code |
+| `bss2`    | several BSS symbols — run splitting at labels; unreferenced symbols folded in |
+| `bssdata` | BSS overlaid by a `,DATA,` section: labels owned by the data words (§5.10) |
+| `bssset`  | `,SET,` from a literal — `set_len > 0` with `data_len == 0` (§5.10) |
+| `int41`   | 41-bit signed `,INT,`: 0, ±1, the ±10000 `-c` radix threshold, ±2²⁴, ±(2⁴⁰−1) |
 
 ```
 ./run-tests.sh            # assemble + diff all, report PASS/FAIL
@@ -238,16 +281,34 @@ with `dtran -F dms`, and diffs against the golden `tests/<name>.expected`:
 ```
 
 Requires `dubna` on PATH (skips with exit 77 otherwise). `object.o` is byte-deterministic
-across assembler runs, so golden diffs are stable. **Finding:** these tests proved MADLEN
+across assembler runs, so golden diffs are stable.
+
+Beyond the golden diffs, every test module has been re-assembled and re-disassembled in
+`default` / `-e` / `-l -e` / `-o`: all 11 × 4 reproduce the original disassembly exactly.
+`-c` (litconst) is **not** a round-trip mode by design. `get_literal_dms` emits
+Pascal-flavoured literals for reading and for the `decomp` pipeline, always parenthesized:
+
+| word | `-c` literal |
+|------|--------------|
+| exponent 0 | `(<octal>C)` |
+| exponent `0150`, `|value| > 10000` | `(<octal>B)` — of the raw 41-bit field |
+| exponent `0150`, `|value| <= 10000` | `(<decimal>)` — signed |
+| ISO / TEXT / char | `iso('...')`, `(*"..."*)`, `char('x')` |
+
+MADLEN accepts none of these as an operand — for a large value it takes only the `=300000`
+literal-pool form — and rendering constants as literals also leaves the constant-pool
+addresses `prdata` refers to undefined. Both are inherent to the mode, not defects.
+The `,INT,` constant-pool lines `-c` still prints come from `prconst_dms` and stay decimal
+(§5.11). **Finding:** these tests proved MADLEN
 accepts only `J+M` for opcode `0x025000`, fixing the earlier `M+J` regression (§5.6).
 
 ## 9. Open follow-up
-- BSS sections (DMS) and the `-I`/`-A`/`-T` Pascal-B offset paths are carried over but not
-  exercised by the current samples.
+- The `-I`/`-A`/`-T` Pascal-B offset paths are carried over but not exercised by the
+  current samples.
 - Auto-detect requires `cmd_len > 0`, so a command-less DMS module (e.g. an empty or
   const/data-only object) is not detected and needs explicit `-F dms`. The coverage tests
   force `-F dms` for this reason.
 
 ## 10. Result
-`dtran.cc` is ~1450 lines (shared core, three backends, `main`). Build with `make`.
-Coverage: `./run-tests.sh` (6 DMS round-trip tests).
+`dtran.cc` is ~2000 lines (shared core, three backends, `main`). Build with `make`.
+Coverage: `./run-tests.sh` (11 DMS round-trip tests).

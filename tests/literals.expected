@@ -12,7 +12,7 @@ C Actual length of the object file is 12
 C Symbol table offset is 11
  ,XTA,1
   :,INT,5
- ,INT,01111740B
+ ,INT,300000
  ,LOG,7777000000000000
  ,TEXT, 8HABCDEFGH
  ,ISO, 6H012345 . 060 061 062 063 064 065 

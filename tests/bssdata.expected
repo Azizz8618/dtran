@@ -1,0 +1,24 @@
+ BSSDATA :,NAME, NEW DTRAN
+C Commands: 2
+C Constants: 1
+C BSS: 3
+C Memory size: 6
+C Header: 1
+C Symbols: 3
+C Long symbols: 1
+C Debug: 0
+C Data: 2 + set: 1
+C Actual length of the object file is 16
+C Symbol table offset is 11
+ STOP*   :,SUBP,
+ ,XTA,*0002B
+ ,ATX,*0003B
+ 13,VJM,STOP*   
+ *0002B:,LOG,1
+ ,BSS,3
+ ,DATA,
+ *0003B:,INT,5
+ ,INT,6
+ 2,SET,*0003B
+ 1,   ,*0003B
+ ,END,

@@ -144,6 +144,7 @@ struct opcode {
 };
 
 typedef unsigned long long uint64;
+typedef long long int64;
 typedef unsigned int uint32;
 typedef unsigned int uint;
 
@@ -214,10 +215,10 @@ void populate_itm() {
     for (int i = 1; i < 0140; ++i) {
         if (gost_to_itm[i] == 0)
             continue;
-        if (itm_to_utf[gost_to_itm[i]])
-            fprintf(stderr, "GOST %03o maps to the same ITM as GOST %s\n",
-                    i, itm_to_utf[gost_to_itm[i]]);
-        else
+        if (itm_to_utf[gost_to_itm[i]]) {
+            // fprintf(stderr, "GOST %03o maps to the same ITM as GOST %s\n",
+            //         i, itm_to_utf[gost_to_itm[i]]);
+        } else
             itm_to_utf[gost_to_itm[i]] = gost_to_utf[i];
     }
 }
@@ -555,6 +556,23 @@ struct Dtran {
         return (word >> 40) || ((word >> 32) && total-zeros > 2);
     }
 
+    // A BESM-6 integer is the 41-bit two's-complement field in bits 41..1,
+    // under a fixed exponent of 0150 in bits 48..42.  The magnitude is *not*
+    // limited to 24 bits, and it is signed: MADLEN assembles ",INT,16777216"
+    // to 6400000100000000 and ",INT,-5" to 6437777777777773.  (Pascal-B's
+    // format_map keeps its own narrower test on purpose — there the word may
+    // be code, so matching every word whose top 7 bits are 0150 would misfire.)
+    bool is_int(uint64 word) {
+        return (word >> 41) == 0150;
+    }
+    uint64 int_bits(uint64 word) {
+        return word & ((1ULL << 41) - 1);
+    }
+    int64 int_value(uint64 word) {
+        uint64 d = int_bits(word);
+        return d >> 40 ? (int64)(d - (1ULL << 41)) : (int64)d;
+    }
+
     // ==================================================================
     // DMS backend (object files)                  [dtran2.cc / dtran3.cc]
     // ==================================================================
@@ -588,8 +606,6 @@ struct Dtran {
             const_len = (memory[2] >> 30) & 077777;
             cmd_off = 3;
         }
-        if (bss_len != 0)
-            fprintf(stderr, "BSS section not fully supported yet\n");
         table_off = cmd_off + cmd_len + const_len + data_len + set_len;
         long_off = table_off + head_len + sym_len;
         debug_off = long_off + long_len;
@@ -606,8 +622,6 @@ struct Dtran {
         printf("C Debug: %o\n", debug_len);
         printf("C Data: %o + set: %o\n", data_len, set_len);
         printf("C Actual length of the object file is %o\n", comment_off);
-        if (nolabels)
-            printf(" /:,BSS,\n");
     }
 
     std::string gak(uint i) {
@@ -646,6 +660,8 @@ struct Dtran {
                 printf(" %s:,SUBP,\n", symtab[i].c_str());
             } else if ((word & 057000000) == 047000000) {
                 printf(" %s:,LC,%d\n", symtab[i].c_str(), (uint)word & 0777777);
+            } else if ((word & 057000000) == 046000000) {
+                printf(" %s:,LP,%d\n", symtab[i].c_str(), (uint)word & 0777777);
             } else if (((word >> 24) & 077774000) == 04000 &&
                        (word & 077777777) < 0100000) {
                 uint sym = (word >> 24) & 03777;
@@ -781,12 +797,15 @@ struct Dtran {
     std::string get_literal_dms(uint32 addr) {
         uint64 val = memory[addr + cmd_off];
         std::string ret;
-        if ((val >> 24) == 064000000) {
-            unsigned d = val & 077777777;
-            if (d > 10000)
-                ret = strprintf("%08oB", d);
+        if (is_int(val)) {
+            // Small values read as decimal, large ones as octal (of the raw
+            // 41-bit field).  Every literal here is parenthesized, including
+            // the octal form, as are the ISO/TEXT/0-exponent cases below.
+            int64 d = int_value(val);
+            if (d < -10000 || d > 10000)
+                ret = strprintf("(%08lloB)", int_bits(val));
             else
-                ret = strprintf("(%d)", d);
+                ret = strprintf("(%lld)", d);
         } else if (dms_is_iso(val)) {
             ret = strprintf("iso('%s')", dms_get_iso_word(val).c_str());
         } else if (is_likely_text(val)) {
@@ -820,12 +839,10 @@ struct Dtran {
             } else {
                 printf(" %s:", labels[cur].c_str());
             }
-            if ((val >> 24) == 064000000) {
-                unsigned d = val & 077777777;
-                if (d > 200000)
-                    printf(",INT,%08oB\n", d);
-                else
-                    printf(",INT,%d\n", d);
+            if (is_int(val)) {
+                // Always decimal: MADLEN reads a large octal operand (as in
+                // ",INT,01111740B") as an out-of-range address and rejects it.
+                printf(",INT,%lld\n", int_value(val));
             } else if (dms_is_iso(val)) {
                 printf(",ISO, 6H%s . %s\n", quoteiso(dms_get_iso_word(val)).c_str(), get_bytes(val).c_str());
             } else if (is_likely_text(val)) {
@@ -907,9 +924,34 @@ struct Dtran {
         }
     }
 
-    void prbss (uint32 addr, uint32 limit) {
-        // TODO: support BSS section
-        printf("C here be BSS entries, %05o-%05o\n", addr, addr+limit-1);
+    // A BSS word opens a new ",BSS," run if it carries a label of its own.
+    // Words shared with the DATA section normally do not: ",DATA," restarts the
+    // location counter at the BSS base, so prconst_dms() prints those labels
+    // there and MADLEN rejects a doubly-described identifier.  Under litconst
+    // the data words come out as prdata() assignments, which define nothing, so
+    // then the BSS section is what has to carry the labels.
+    bool bss_labelled (uint32 cur, uint32 base, bool litconst) {
+        if (!litconst && cur < base + data_len)
+            return false;
+        return !labels[cur].empty();
+    }
+
+    // The BSS section occupies runtime addresses [addr, addr+len) but takes up
+    // no space in the object file. Emit one ",BSS,n" per labelled run, so that
+    // re-assembly recreates both the symbol positions and the total size.
+    void prbss (uint32 addr, uint32 len, bool litconst) {
+        uint32 limit = addr + len;
+        for (uint32 cur = addr; cur < limit; ) {
+            uint32 next = cur + 1;
+            while (next < limit && !bss_labelled(next, addr, litconst))
+                ++next;
+            if (bss_labelled(cur, addr, litconst))
+                printf(" %s:", labels[cur].c_str());
+            else
+                putchar(' ');
+            printf(",BSS,%d\n", next - cur);
+            cur = next;
+        }
     }
 
     void prtext_dms (bool litconst) {
@@ -1746,7 +1788,10 @@ struct Dtran {
             dump_symtab();
             prtext_dms(litconst);
             prconst_dms(cmd_len, const_len, litconst);
-            if (data_len) {
+            prbss(cmd_len + const_len, bss_len, litconst);
+            // A module may carry SET operators with no DATA words of its own
+            // (",SET," from a literal), so set_len alone still opens ",DATA,".
+            if (data_len || set_len) {
                 printf(" ,DATA,\n");
                 if (litconst) {
                     prdata();
